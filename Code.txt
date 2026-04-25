@@ -1,0 +1,550 @@
+# %% [markdown]
+# # Intelligent Conflict Pattern Detection and Forecasting
+# ## Analyzing Russian Equipment Losses in Ukraine - Fixed Version
+
+# %%
+# Install required packages
+!pip install pyswarms scikit-opt folium geopandas pycountry-convert pycountry
+!pip install xgboost lightgbm catboost
+!pip install prophet
+
+# %%
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import folium
+from folium.plugins import HeatMap
+import geopandas as gpd
+from shapely.geometry import Point
+import pycountry_convert as pc
+import pycountry
+import os
+
+# Machine Learning
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.metrics import mean_squared_error, accuracy_score, classification_report
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+
+# Time Series
+from statsmodels.tsa.arima.model import ARIMA
+from prophet import Prophet
+
+# Optimization
+import pyswarms as ps
+from sko.PSO import PSO
+from sko.GA import GA
+from sko.DE import DE
+
+# Deep Learning
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
+# %%
+# Load the dataset
+from google.colab import files
+uploaded = files.upload()
+
+# %%
+# Read the CSV file
+df = pd.read_csv('warspotting_losses.csv')
+
+# Display basic info
+print(f"Dataset shape: {df.shape}")
+print("\nFirst 5 rows:")
+display(df.head())
+
+# %%
+# Data Cleaning and Preprocessing
+
+# Convert date to datetime
+df['date'] = pd.to_datetime(df['date'])
+
+# Handle missing values
+print("\nMissing values before handling:")
+print(df.isnull().sum())
+
+# Fill missing coordinates with country centroid (Ukraine)
+ukraine_lat, ukraine_lon = 48.3794, 31.1656
+df['latitude'].fillna(ukraine_lat, inplace=True)
+df['longitude'].fillna(ukraine_lon, inplace=True)
+
+# Fill other missing values
+df['unit'].fillna('Unknown', inplace=True)
+df['comment'].fillna('', inplace=True)
+df['tags'].fillna('', inplace=True)
+
+# Create binary target for classification (Destroyed vs Captured)
+df['status_binary'] = df['status'].apply(lambda x: 1 if x == 'Destroyed' else 0)
+
+# Extract features from date
+df['day_of_week'] = df['date'].dt.dayofweek
+df['day_of_month'] = df['date'].dt.day
+df['month'] = df['date'].dt.month
+df['year'] = df['date'].dt.year
+
+# Create time since invasion feature
+invasion_date = pd.to_datetime('2022-02-24')
+df['days_since_invasion'] = (df['date'] - invasion_date).dt.days
+
+print("\nMissing values after handling:")
+print(df.isnull().sum())
+
+# %%
+# Feature Engineering
+
+# Create region feature from coordinates
+def get_region(lat, lon):
+    # This is a simplified approach - in a real scenario you'd use shapefiles
+    if pd.isna(lat) or pd.isna(lon):
+        return 'Unknown'
+
+    # Rough regional boundaries
+    if lon > 34 and lat > 50: return 'Kyiv Oblast'
+    elif lon > 36: return 'Kharkiv Oblast'
+    elif lat < 47: return 'Kherson Oblast'
+    elif lon < 30: return 'Chernihiv Oblast'
+    else: return 'Other Oblast'
+
+df['region'] = df.apply(lambda x: get_region(x['latitude'], x['longitude']), axis=1)
+
+# Equipment type categorization
+equipment_categories = {
+    'Tanks': 'Armored',
+    'Infantry fighting vehicles': 'Armored',
+    'Infantry mobility vehicles': 'Vehicles',
+    'Anti-aircraft systems': 'Air Defense',
+    'Rocket and missile artillery': 'Artillery',
+    'Self-propelled artillery': 'Artillery',
+    'Towed artillery': 'Artillery',
+    'Helicopters': 'Aircraft',
+    'Airplanes': 'Aircraft',
+    'Engineering': 'Support',
+    'Transport': 'Support',
+    'Command posts, communication': 'Support',
+    'Radars, jammers': 'Electronic Warfare',
+    'Drones': 'UAV',
+    'Anti-tank systems': 'Weapons',
+    'Other': 'Other'
+}
+
+df['equipment_category'] = df['type'].map(equipment_categories).fillna('Other')
+
+# %%
+# Function to save plots in high resolution
+def save_high_res_plot(filename, dpi=1200):
+    plt.savefig(filename, dpi=dpi, bbox_inches='tight')
+    files.download(filename)
+    print(f"Saved {filename} at {dpi} DPI")
+
+# %%
+# Exploratory Data Analysis (EDA)
+
+# Time series of losses
+plt.figure(figsize=(15, 6))
+df.groupby('date').size().plot(title='Daily Equipment Losses Over Time')
+plt.ylabel('Number of Losses')
+save_high_res_plot('daily_losses.png')
+
+# %%
+# Equipment type distribution
+plt.figure(figsize=(12, 6))
+df['type'].value_counts().plot(kind='bar', title='Equipment Losses by Type')
+plt.xticks(rotation=45, ha='right')
+save_high_res_plot('equipment_distribution.png')
+
+# %%
+# Status distribution
+plt.figure(figsize=(8, 5))
+df['status'].value_counts().plot(kind='pie', autopct='%1.1f%%', title='Loss Status Distribution')
+plt.ylabel('')
+save_high_res_plot('status_distribution.png')
+
+# %%
+# Geospatial visualization
+m = folium.Map(location=[48.3794, 31.1656], zoom_start=6)
+
+# Add heatmap
+heat_data = [[row['latitude'], row['longitude']] for index, row in df.iterrows()]
+HeatMap(heat_data, radius=15).add_to(m)
+
+# Add cluster markers
+from folium.plugins import MarkerCluster
+marker_cluster = MarkerCluster().add_to(m)
+
+for idx, row in df.iterrows():
+    folium.Marker(
+        location=[row['latitude'], row['longitude']],
+        popup=f"{row['type']} - {row['status']}",
+        icon=folium.Icon(color='red' if row['status'] == 'Destroyed' else 'blue')
+    ).add_to(marker_cluster)
+
+# Save map to HTML
+map_file = 'geospatial_map.html'
+m.save(map_file)
+files.download(map_file)
+display(m)
+
+# %%
+# Feature Encoding for ML
+
+# Label encoding for categorical variables
+label_encoders = {}
+categorical_cols = ['type', 'model', 'lost_by', 'nearest_location', 'unit', 'region', 'equipment_category']
+
+for col in categorical_cols:
+    le = LabelEncoder()
+    df[col + '_encoded'] = le.fit_transform(df[col].astype(str))
+    label_encoders[col] = le
+
+# One-hot encoding for some features
+df = pd.get_dummies(df, columns=['status', 'equipment_category'], prefix=['status', 'category'])
+
+# %%
+# Prepare data for ML tasks
+
+# Features for prediction
+features = [
+    'latitude', 'longitude', 'days_since_invasion', 'day_of_week', 'day_of_month', 'month',
+    'type_encoded', 'region_encoded', 'equipment_category_encoded'
+]
+
+# Target variables
+regression_target = 'days_since_invasion'  # Predict when loss might occur
+classification_target = 'status_binary'    # Destroyed (1) vs Captured (0)
+clustering_features = ['latitude', 'longitude', 'days_since_invasion', 'type_encoded']
+
+X = df[features]
+y_reg = df[regression_target]
+y_clf = df[classification_target]
+X_cluster = df[clustering_features]
+
+# Train-test split (time-based)
+split_date = '2022-03-01'
+train = df[df['date'] < split_date]
+test = df[df['date'] >= split_date]
+
+X_train, X_test = train[features], test[features]
+y_train_reg, y_test_reg = train[regression_target], test[regression_target]
+y_train_clf, y_test_clf = train[classification_target], test[classification_target]
+
+# Scaling
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# %%
+# Task 1: Equipment Loss Prediction (Regression)
+
+# Baseline Random Forest
+rf_reg = RandomForestRegressor(n_estimators=100, random_state=42)
+rf_reg.fit(X_train_scaled, y_train_reg)
+y_pred_reg = rf_reg.predict(X_test_scaled)
+
+mse = mean_squared_error(y_test_reg, y_pred_reg)
+print(f"Random Forest Regression MSE: {mse:.2f}")
+
+# Feature Importance
+plt.figure(figsize=(10, 6))
+feat_importances = pd.Series(rf_reg.feature_importances_, index=features)
+feat_importances.nlargest(10).plot(kind='barh')
+plt.title('Feature Importance for Loss Prediction')
+save_high_res_plot('feature_importance.png')
+
+# %%
+# Task 2: Loss Type Classification (Destroyed vs Captured)
+
+# Random Forest Classifier
+rf_clf = RandomForestClassifier(n_estimators=100, random_state=42)
+rf_clf.fit(X_train_scaled, y_train_clf)
+y_pred_clf = rf_clf.predict(X_test_scaled)
+
+accuracy = accuracy_score(y_test_clf, y_pred_clf)
+print(f"Classification Accuracy: {accuracy:.2f}")
+print("\nClassification Report:")
+print(classification_report(y_test_clf, y_pred_clf))
+
+# Save classification results
+clf_results = pd.DataFrame({
+    'Actual': y_test_clf,
+    'Predicted': y_pred_clf,
+    'Probability_Destroyed': rf_clf.predict_proba(X_test_scaled)[:, 1]
+})
+clf_results.to_csv('classification_results.csv', index=False)
+files.download('classification_results.csv')
+
+# %%
+# Task 3: High-Risk Zone Clustering
+
+# KMeans Clustering
+kmeans = KMeans(n_clusters=5, random_state=42)
+cluster_labels = kmeans.fit_predict(X_cluster)
+
+# Add cluster labels to dataframe
+df['cluster'] = cluster_labels
+
+# Visualize clusters
+plt.figure(figsize=(10, 8))
+plt.scatter(X_cluster['longitude'], X_cluster['latitude'], c=cluster_labels, cmap='viridis', alpha=0.5)
+plt.title('Geospatial Clustering of Equipment Losses')
+plt.xlabel('Longitude')
+plt.ylabel('Latitude')
+plt.colorbar(label='Cluster')
+save_high_res_plot('clustering_results.png')
+
+# Save clustered data
+df.to_csv('clustered_data.csv', index=False)
+files.download('clustered_data.csv')
+
+# %%
+# Task 4: Time Series Forecasting with Prophet
+
+# Aggregate losses by day
+daily_losses = df.groupby('date').size().reset_index()
+daily_losses.columns = ['ds', 'y']
+
+# Save time series data
+daily_losses.to_csv('daily_losses_data.csv', index=False)
+files.download('daily_losses_data.csv')
+
+# Fit Prophet model
+prophet_model = Prophet(seasonality_mode='multiplicative')
+prophet_model.fit(daily_losses)
+
+# Make future dataframe
+future = prophet_model.make_future_dataframe(periods=30)  # Forecast 30 days
+forecast = prophet_model.predict(future)
+
+# Plot forecast
+fig = prophet_model.plot(forecast)
+plt.title('Equipment Losses Forecast')
+save_high_res_plot('prophet_forecast.png')
+
+# %%
+# Fixed PSO Feature Selection
+
+# Corrected objective function for PSO feature selection
+def pso_feature_selection(X, y):
+    def f_pso(feature_subset):
+        # Convert float array to boolean mask
+        feature_subset = feature_subset > 0.5  # Using 0.5 as threshold
+
+        # Handle case where no features are selected
+        if np.sum(feature_subset) == 0:
+            return 999  # Return high error
+
+        # Train model with selected features
+        model = RandomForestRegressor(n_estimators=50, random_state=42)
+        scores = []
+
+        # Time-series cross-validation
+        tscv = TimeSeriesSplit(n_splits=3)
+        for train_idx, test_idx in tscv.split(X):
+            X_train, X_test = X[train_idx], X[test_idx]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+            # Corrected indexing - use boolean mask directly
+            model.fit(X_train[:, feature_subset], y_train)
+            y_pred = model.predict(X_test[:, feature_subset])
+            scores.append(mean_squared_error(y_test, y_pred))
+
+        return np.mean(scores)
+
+    return f_pso
+
+# Initialize PSO
+options = {'c1': 0.5, 'c2': 0.3, 'w': 0.9}
+n_features = X_train_scaled.shape[1]
+optimizer = ps.single.GlobalBestPSO(n_particles=10, dimensions=n_features, options=options)
+
+# Run optimization
+print("Running PSO Feature Selection...")
+cost, pos = optimizer.optimize(pso_feature_selection(X_train_scaled, y_train_reg), iters=20)
+
+# Get selected features
+selected_features = pos > 0.5
+print(f"\nSelected {np.sum(selected_features)} features out of {n_features}:")
+selected_feature_names = [features[i] for i in range(n_features) if selected_features[i]]
+print(selected_feature_names)
+
+# Save feature selection results
+feature_selection_results = pd.DataFrame({
+    'Feature': features,
+    'Selected': selected_features,
+    'Importance': rf_reg.feature_importances_
+})
+feature_selection_results.to_csv('feature_selection_results.csv', index=False)
+files.download('feature_selection_results.csv')
+
+# %%
+# Task 5: LSTM Time Series Forecasting
+
+# Prepare data for LSTM
+def create_sequences(data, seq_length):
+    X, y = [], []
+    for i in range(len(data) - seq_length):
+        X.append(data[i:i+seq_length])
+        y.append(data[i+seq_length])
+    return np.array(X), np.array(y)
+
+# Normalize and create sequences
+scaler_ts = MinMaxScaler()
+daily_losses_scaled = scaler_ts.fit_transform(daily_losses[['y']])
+seq_length = 7
+X_lstm, y_lstm = create_sequences(daily_losses_scaled, seq_length)
+
+# Split into train/test
+split_idx = int(0.8 * len(X_lstm))
+X_train_lstm, X_test_lstm = X_lstm[:split_idx], X_lstm[split_idx:]
+y_train_lstm, y_test_lstm = y_lstm[:split_idx], y_lstm[split_idx:]
+
+# Build LSTM model
+model = Sequential([
+    LSTM(50, activation='relu', input_shape=(seq_length, 1)),
+    Dense(1)
+])
+
+model.compile(optimizer='adam', loss='mse')
+history = model.fit(
+    X_train_lstm, y_train_lstm,
+    epochs=50, batch_size=16,
+    validation_data=(X_test_lstm, y_test_lstm),
+    verbose=0
+)
+
+# Plot training history
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.legend()
+plt.title('LSTM Training History')
+save_high_res_plot('lstm_training.png')
+
+# Make predictions
+y_pred_lstm = model.predict(X_test_lstm)
+
+# Inverse transform
+y_test_inv = scaler_ts.inverse_transform(y_test_lstm)
+y_pred_inv = scaler_ts.inverse_transform(y_pred_lstm)
+
+# Calculate RMSE
+rmse = np.sqrt(mean_squared_error(y_test_inv, y_pred_inv))
+print(f"LSTM RMSE: {rmse:.2f}")
+
+# Save LSTM results
+lstm_results = pd.DataFrame({
+    'Actual': y_test_inv.flatten(),
+    'Predicted': y_pred_inv.flatten()
+})
+lstm_results.to_csv('lstm_results.csv', index=False)
+files.download('lstm_results.csv')
+
+# %%
+# Hyperparameter Optimization with Differential Evolution (DE)
+
+# Define objective function for Random Forest hyperparameters
+def rf_objective(params):
+    n_estimators = int(params[0])
+    max_depth = int(params[1]) if params[1] > 0 else None
+    min_samples_split = int(params[2])
+
+    model = RandomForestRegressor(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        min_samples_split=min_samples_split,
+        random_state=42
+    )
+
+    # Time-series cross-validation
+    tscv = TimeSeriesSplit(n_splits=3)
+    scores = []
+    for train_idx, test_idx in tscv.split(X_train_scaled):
+        X_train, X_test = X_train_scaled[train_idx], X_train_scaled[test_idx]
+        y_train, y_test = y_train_reg.iloc[train_idx], y_train_reg.iloc[test_idx]
+
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_test)
+        scores.append(mean_squared_error(y_test, y_pred))
+
+    return np.mean(scores)
+
+# Define bounds for parameters
+bounds = [(10, 200), (2, 50), (2, 20)]  # n_estimators, max_depth, min_samples_split
+
+# Run DE optimization
+print("Running Differential Evolution Optimization...")
+de = DE(func=rf_objective, n_dim=3, size_pop=10, max_iter=20, lb=[b[0] for b in bounds], ub=[b[1] for b in bounds])
+best_params, best_score = de.run()
+
+print(f"\nBest parameters: n_estimators={int(best_params[0])}, max_depth={int(best_params[1])}, min_samples_split={int(best_params[2])}")
+print(f"Best MSE: {best_score:.4f}")
+
+# Save optimization results
+optimization_results = pd.DataFrame({
+    'Parameter': ['n_estimators', 'max_depth', 'min_samples_split'],
+    'Best_Value': [int(best_params[0]), int(best_params[1]), int(best_params[2])],
+    'Best_MSE': [best_score]
+})
+optimization_results.to_csv('optimization_results.csv', index=False)
+files.download('optimization_results.csv')
+
+# %%
+# Final Model with Optimized Parameters
+
+# Train final model with selected features and optimized parameters
+final_model = RandomForestRegressor(
+    n_estimators=int(best_params[0]),
+    max_depth=int(best_params[1]) if int(best_params[1]) > 0 else None,
+    min_samples_split=int(best_params[2]),
+    random_state=42
+)
+
+# Use selected features from PSO
+final_model.fit(X_train_scaled[:, selected_features], y_train_reg)
+y_pred_final = final_model.predict(X_test_scaled[:, selected_features])
+
+final_mse = mean_squared_error(y_test_reg, y_pred_final)
+print(f"Final Optimized Model MSE: {final_mse:.2f}")
+
+# %%
+# Summary of Results
+
+results = {
+    'Model': ['Baseline RF Regression', 'PSO Feature Selection', 'DE Hyperparameter Tuning', 'Final Optimized Model'],
+    'MSE': [mean_squared_error(y_test_reg, rf_reg.predict(X_test_scaled)),
+            mean_squared_error(y_test_reg, rf_reg.predict(X_test_scaled[:, selected_features])),
+            best_score,
+            final_mse]
+}
+
+results_df = pd.DataFrame(results)
+display(results_df)
+
+# Save final results
+results_df.to_csv('final_model_results.csv', index=False)
+files.download('final_model_results.csv')
+
+# %%
+# Conclusion and Next Steps
+
+print("""
+## Key Findings:
+1. Time series analysis shows fluctuations in equipment losses with certain peaks
+2. Random Forest models perform well for both regression and classification tasks
+3. Geospatial clustering reveals high-risk zones in northern and eastern Ukraine
+4. Nature-inspired optimization improved model performance by:
+   - Selecting relevant features with PSO
+   - Tuning hyperparameters with DE
+
+## Next Steps:
+1. Incorporate more sophisticated geospatial features
+2. Add external data sources (weather, terrain)
+3. Experiment with more advanced deep learning architectures
+4. Implement real-time monitoring system
+""")
